@@ -1,0 +1,356 @@
+#!/usr/bin/perl -X -I /var/www/project2
+use strict;
+use XML::Simple;
+use Data::Dumper qw( Dumper );
+use Log::Log4perl qw(get_logger :levels);
+#use Date::Calc qw(:all);
+use open IO => ":utf8", ":std";
+use utf8;
+use Encode;
+use DBI;
+use App::projectDB;
+use Storable qw(store retrieve);
+use 5.10.1;
+use POSIX;
+use DateTime;
+use Net::LDAP;
+use Mail::Box::POP3;
+use Net::SMTP;
+use CGI;
+use Workflow::Factory qw( FACTORY );
+use App::ExecAction;
+our $config = XMLin( '/var/www/project2/config.xml', KeyAttr => '' );
+my $base_dir = $config->{basedir} . '/';
+FACTORY->add_config_from_file( persister => $base_dir . 'persister.xml' );
+Log::Log4perl::init( $base_dir . 'log4designate.conf' );
+my $log = get_logger();
+my $onedaymax = 20;
+my $onerunmax = 10;
+my %id_transl; 
+$log->info( "Starting designator: ", scalar(localtime) );
+
+my %addrbook;
+foreach my $a (@{$config->{admin}}) {
+    $addrbook{lc $a->{login}} = $a->{mail}
+}
+my $projectdb = App::projectDB->connect('dbi:mysql:database=projectdb:host=localhost',
+                'projectuser','***************',
+                { mysql_enable_utf8 => 1});
+my $run;
+my $td = DateTime->today();
+my $today= $td->ymd("-");
+my $designator_cfg = XMLin( '/etc/designator.xml', KeyAttr => '' );
+my $waga = $designator_cfg->{waga};
+while (my ($k,$v) = each %$waga) { #test poprawności wag
+      $waga->{$k} = 100 if ($v !~ /(100)|(^0$)|(^\d0$)/o);
+    }
+eval {$run = retrieve('/var/www/project2/storable/run')};
+$run = {date_last => $today} if ($@);
+if ($run->{last_run} eq 'not ok') {
+    $log->error("Last run stopped badly. Exiting program");
+    die;
+}
+$run->{last_run} = 'not ok';
+my $bucket={};
+eval {$bucket = retrieve('/var/www/project2/storable/bucket')};
+#zakładamy, że waga w designator.xml zawiera pełną listę adminów
+#odtwarzanie bucket na podstawie list adminów z xml. Punkty są zerowane.
+if ($@) {
+    foreach (keys %$waga) {
+        $bucket->{$_} = 0;
+    }
+} else {
+    #gdy w designator.xml pojawi się nowy admin
+    #wtedy dodajemy go do bucket wraz z pierwszą z liczbą punktów pierwszego z brzegu admina
+    #tak, aby nowy nie zaczynał od zera.
+    my ($first) = values %$bucket;
+    foreach (keys %$waga) {
+        $bucket->{$_} = $first if (! exists $bucket->{$_}); 
+    }
+    # i w drugą stronę: jeśli w waga nie ma admina, który jest w bicket tzn, że został świadomie usunięty
+    # i należy usunąć go również z bucket
+    foreach (keys %$bucket) {
+        delete $bucket->{$_} if (! exists $waga->{$_}); 
+    }
+}
+
+#tutaj powinniśmy porównać listę adminów z bucket z listą z pliku konfigracyjnego i jesli się nie zgadza, to alarm
+#bowiem może się zdarzyć, że skrypt zawiesi się w nieodpowiednim momencie i lista z bucket będzie wadliwa.
+my $usermem = {};
+eval {$usermem = retrieve('/var/www/project2/storable/usermem')};
+#$run->{date_last} = $today;
+#$today='2020-02-12';
+$Data::Dumper::Indent = 0;
+$log->info("Env befor run :\nbucket: ".Dumper($bucket)."\nrun: ".Dumper($run)."\nwaga: ".Dumper($waga)."\nusermem: ".Dumper($usermem)."\ntoday: ".$today);
+##########NEW DAY#############
+if ( $today ne $run->{date_last}) { # it's new day
+    $log->info("Run procedure for new day");
+    test_autoresponse();
+    #test mailowy - daje to, że nawet jeśli admin zaloguje się w czasie urlopu i to i tak nie będzie wzięty pod uwagę
+    #dla admina na urlopie waga ustawiana jest na 0
+    delete $run->{date_last};
+}
+$run->{date_last} = $today;
+######################
+#Jeśli ktoś nazbierał dużo większą liczbę punktów niż średnia, to go oszczędzamy w tym obiegu.
+my %preserve;
+my ($sum,$i);
+foreach (values %$bucket) {
+    $sum += $_;
+    $i++;
+}
+my $average = $sum/$i;
+my @sort = sort { $bucket->{$a} <=> $bucket->{$b} } keys %$bucket;
+my $mostduty = $sort[-1]; #admin with max points
+if (($bucket->{$mostduty} - $average) > 50) {
+    $preserve{$mostduty} = $bucket->{$mostduty}; #opis preserve niżej
+    delete $bucket->{$mostduty};
+}
+####################
+#Sprawdzanie obecności z lastlogon. Nie stosujemy waga=0 jak dla urlopów, lecz:
+#1) usuwamy tymczasowo z bucket, zapamiętując przedtem ich punkty (preserve)
+#2) po koniec skryptu z powrotem dodajemy do hasha.
+#Pozostaje jednak w usermem, czyli dostaje wnioski będące kontynuacją serii od jednego wnioskującego.
+my %obecni = ifobecni();
+while (my ($adm,$pr) = each %obecni) {
+    if ($obecni{$adm} == 0 and exists $bucket->{$adm}) {
+        $preserve{$adm} = $bucket->{$adm};
+        delete $bucket->{$adm};
+    }
+}
+#####################
+if (! keys %$bucket) {
+    $log->info("Jeszcze nikogo nie ma w pracy.");
+        exit;
+}
+my %oneruncounter;
+foreach my $table ( keys %{ $config->{autodesignate} } ) {
+    $log->info( "Working on table: ", $table );
+    $table = ucfirst $table;
+    #Schema:
+    ######Logowanie zapytań SQL########
+    #use DBIx::Class::QueryLog::NotifyOnMax;
+    #use DBIx::Class::QueryLog::Analyzer;
+    #my $ql = DBIx::Class::QueryLog::NotifyOnMax->new(max_count => 100);
+    #$projectdb->storage->debugobj($ql);
+    #$projectdb->storage->debug(1);
+    ###################################
+    #Result Sets:
+    #--------------------
+    my $packets={};
+    my $table_rs = $projectdb->resultset($table)->search(
+        {-or => [status => { like => 'ZTDISP'}, status =>{ like =>'ZRBDISP'}]},
+        {columns => [qw/wniosek_id user/]});
+    while (my $row  = $table_rs->next) {
+        my $workflow_id=$projectdb->resultset('WorkflowWniosek')->single({wniosek_id => {'=',$row->wniosek_id}})->workflow_id;
+        #robimy paczkę
+        my $user = $row->user;
+        #$user =~ s/\\//; #musimy pozbyć się \.
+        push @{$packets->{lc $user}},$workflow_id;
+        $id_transl{$workflow_id} = $row->wniosek_id;
+    }
+    #say Dumper($packets);
+    my @sorted;
+    #Dla każdej paczki wyznaczamy admina z najmniejszą ilością punktów (*), wysyłamy mu wnioski i dodajemy mu punkty
+    #(*) lub wyznaczamy tego admina, który w poprzenim obiegu realizował wnioski danego wnioskodawcy. Czyli jeśli założymy że skrypt
+    #uruchamia sie co godzinę, wystarczy, że przez godzinę nie będą nadchodziły wnioski danego usera i pamięć się kasuje.
+    foreach my $p (keys %$packets) { #$p będzie tutaj wnioskodawcą
+        my $selected;
+        if (exists $usermem->{$p}) {
+            $selected = $usermem->{$p} if (exists $bucket->{$usermem->{$p}});
+            #bo w poprzednim obiegu admin realizował wnioski tego wnioskodawcy 
+            $log->debug("Kontynuacja realizacji dla $p przez ".$usermem->{$p});
+        } else {
+            delete $usermem->{$p}; #w poprzednim obiegu nie było wniosków wnioskodawcy $p, więc kasujemy pamięć
+            @sorted = sort { $bucket->{$a} <=> $bucket->{$b} } keys %$bucket;
+            my $i=0;
+            do {    #wyznaczamy admina z najmniejszą ilością punków i jednocześnie wagą >0
+                $selected = $sorted[$i];
+                $i++;
+            } while ($waga->{$selected} == 0 and $run->{$today}->{$selected}>$onedaymax and $oneruncounter{$selected}>$onerunmax and $i < scalar @sorted);
+            #waga=0 oznacza, że admin nie jest brany pod uwagę
+        }
+        #Może się zdarzyć, że wykonawca nie zostanie wyznaczony. Wtedy wnioski muszą czekać na następny obieg.
+        foreach my $wfid (@{$packets->{$p}}) {
+            run_workflow($p,$wfid,$selected,lc $table) if ($selected);
+        }
+        $usermem->{$p} = $selected;
+        $bucket->{$selected} += evaluate_points($selected,scalar @{$packets->{$p}}) if ($selected);
+        #Jeśli admin był na urlopie i miał wagę 0, to po przyjściu od razu dostaje bonusowo max punktów.
+        my @points = sort { $a <=> $b } values %$bucket;
+        my $maxpoints = pop(@points);
+        foreach my $adm (keys %$waga) {
+            if ($waga->{$adm} == 0) {
+                $bucket->{$adm} = $maxpoints;
+            }
+        }
+    }
+    #####Logowanie zapytań SQL########
+    #my $ana = DBIx::Class::QueryLog::Analyzer->new({ querylog => $ql });
+    #my @queries = $ana->get_sorted_queries;
+    #$log->debug( Dumper(@queries) );
+    ####################################
+}
+while (my ($adm,$pnt) = each %preserve) {
+        $bucket->{$adm} = $preserve{$adm};
+}
+$run->{last_run}= 'ok';
+store($bucket,'/var/www/project2/storable/bucket') or die "Can not save program state";
+store($usermem,'/var/www/project2/storable/usermem') or die "Can not save program state";
+store($run,'/var/www/project2/storable/run') or die "Can not save program state";
+$log->info("Env after run :\nbucket: ".Dumper($bucket)."\nrun: ".Dumper($run)."\nwaga: ".Dumper($waga)."\nusermem: ".Dumper($usermem));
+$log->info('<<<<<<<<<<<<<--------------------------->>>>>>>>>>>>');
+sub run_workflow {
+    #say "run workflow: ". join("\t",@_);
+    my ($user, $workflow_id, $adm, $table) = @_;
+    $run->{$today}->{$adm}++; #licznik wniosków dzienny
+    return;
+    my $act_name = $table eq 'kon'?'action_ZRBDISP':'action_ZTDISP';
+    my $query = CGI->new("idu=$id_transl{$workflow_id}&state=$act_name&IfAccept=1&Selected="."cn\\".$adm);#$addrbook{$adm}");
+    my $args  = {
+        query         => $query,
+        config        => $config,
+        user          => $user,
+        workflow_type => $table, };
+    my $action = App::ExecAction->new($args);
+    my ($confirm,$err);
+    eval { $confirm = $action->execute( $act_name, undef )};
+    if ($confirm) {
+        $log->info("Wniosek ID $workflow_id przekazany do realizacji do $adm");
+    } else {
+        $err = "Błąd przekazania do realizacji: $workflow_id , $adm";
+        $log->error($err);
+        mail_alert( $err);
+    }
+}
+sub evaluate_points {
+    my ($admin,$N) = @_;
+    if ($waga->{$admin} == 0) {
+        $log->error("Something dead wrong happend: Waga=0 got to evaluate points");
+    }
+    my $W = $waga->{$admin};
+    return $N*(100/$W);
+}
+sub ifobecni {
+    my %obecni;
+    my $ldap_srv_cn       = 'some ip';
+    my $interesting_attrs = [ 'lastlogon' ];
+    my $ldap_user         = 'ldapbinduser@project.com.pl';
+    my $base              = "DC=project,DC=com,DC=pl";
+    my $ldap           = Net::LDAP->new($ldap_srv_cn) or die "$@";
+    my $msg = $ldap->bind(
+        $ldap_user,
+        password => '*******',
+        version  => 3 );
+        if ($msg->code) {
+            $log->error("Failed binding do domain");
+            mail_alert("Błąd dostępu do domeny");
+            die;
+        }
+    foreach my $user (keys %$bucket) {
+        my $filter     = "samaccountname=$user";
+        my $ldapresult = $ldap->search(
+                base   => $base,
+                filter => $filter,
+                attrs  => $interesting_attrs
+        );
+        if ($ldapresult->code) {
+            $log->error("Failed query to LDAP for $filter");
+        }
+        if ($ldapresult->count <1 ) {
+            $log->error("Admin $user not found");
+            $obecni{$user}=0;
+        } else {
+            $log->debug("Admin $user foud in domain");
+            my $dt2 = DateTime->new(year=>1601, month=>01, day=>01);
+            my $dur = DateTime::Duration->new(nanoseconds => $ldapresult->entry->get_value("lastlogon")*100);
+            $dt2->add($dur);
+            #$obecni{$user}= ($today eq $dt2->ymd("-"))?1:0; 
+            $obecni{$user}= 1; 
+        }
+    }
+    $ldap->unbind;
+    $log->debug("Obecni: ".Dumper(%obecni));
+    return %obecni;
+}
+sub test_autoresponse {
+    my $mail_account = 'some user';
+    my $poppassword = '******';
+    my $mail_host    = $config->{mail_host};
+    my ($smtp, $pop);
+    eval {
+        $smtp = Net::SMTP->new( $mail_host, bits => "8" );
+        $pop = Mail::Box::POP3->new(server_name => $mail_host, username => $mail_account, password => $poppassword);
+    };
+    if ($@) {
+        $log->error("Mail initialization problem: $@");
+        die;
+    }
+    my %addr_list;
+    $log->error("Admin list is empty. Check config.xml") if (scalar @{$config->{admin}} ==0);
+    foreach my $a (@{$config->{admin}}) {
+         $addr_list{lc $a->{email}} = $a->{login}
+    }
+    foreach my $mail (keys %addr_list) {
+        eval {
+            $smtp->mail('user@project.com') or die $smtp->message;
+            $smtp->to($mail) or die $smtp->message;
+            $smtp->data();
+            $smtp->datasend('\n');
+            $smtp->datasend("From: $mail_account\n");
+            $smtp->datasend("To: $mail\n");
+            $smtp->datasend("Subject: 'Test - don't reply'\n");
+            $smtp->datasend("\n");
+            $smtp->datasend( 'autoresponse test' ) or die $smtp->message;
+            $smtp->dataend();
+        };
+        if ($@) {
+            $log->error("Wysyłka maila testowego do $mail zakończyła się błędem: $@");
+            mail_alert("Wysyłka maila testowego do $mail zakończyła się błędem: $@");
+        }
+    }
+    $smtp->quit;
+    sleep 30; #czekamy na pojawienie się autoodpowiedzi w serwerze pocztowym
+    foreach my $id ($pop->messageIds) {
+        my $msg = $pop->messageId($id);
+        if ($msg->study('subject') =~/Automatyczna odpowied/) {
+            my $fromobj = $msg->sender();
+            my $from = lc $fromobj->address();
+            if (grep(/$from/,keys %addr_list)) {
+                $waga->{$addr_list{$from}} = 0;
+                $msg->delete;
+            }
+        }
+        my @errors = $msg->report('WARNINGS');
+        $log->error("POP errors: ".@errors);
+        mail_alert("Pojawiły się błędy POP") if (scalar @errors);
+    }
+}
+sub mail_alert {
+    my ($tresc) = @_;
+    my $mail_account = 'T-CONF';
+    my $mail = 'admin@project.com.pl';
+    my $mail_host    = $config->{mail_host};
+    my $smtp;
+    eval { $smtp = Net::SMTP->new( $mail_host, bits => "8" )};
+    if ($@) {
+        $log->error("Mail initialization problem: $@");
+        die;
+    }
+    eval {
+        $smtp->mail('CONF@.com.pl') or die $smtp->message;
+        $smtp->to($mail) or die $smtp->message;
+        $smtp->data();
+        $smtp->datasend('\n');
+        $smtp->datasend("From: $mail_account\n");
+        $smtp->datasend("To: $mail\n");
+        $smtp->datasend("Subject: 'Alert - designator'\n");
+        $smtp->datasend("\n");
+        $smtp->datasend( $tresc ) or die $smtp->message;
+        $smtp->dataend();
+        $smtp->quit;
+    };
+    if ($@) {
+        $log->error("Wysyłka alertu mailowego zakończyła się błędem: $@");
+    }
+}
